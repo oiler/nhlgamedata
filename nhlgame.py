@@ -27,7 +27,7 @@ from typing import Dict, List, Tuple
 # ============================================================================
 SEASON = "2025"  # Current season year
 GAME_TYPE = "02"  # 01=Preseason, 02=Regular Season, 03=Playoffs, 04=All-Star
-RATE_LIMIT_SECONDS = 10  # Delay between API requests
+RATE_LIMIT_SECONDS = 9  # Delay between API requests
 
 # API Endpoints
 ENDPOINTS = {
