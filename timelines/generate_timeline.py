@@ -226,14 +226,17 @@ def process_penalties_at_time(plays: List[Dict], index: int, tracker: PenaltyTra
                                current_time: int, home_team_id: int, away_team_id: int) -> List[Dict]:
     """
     Process all penalties that occur at the same time as the current event.
-    Calculates coincidental cancellations BY PENALTY TYPE and only adds net penalties to tracker.
+    
+    Applies NHL Rules 19.1 and 19.5 for coincidental penalties:
+    - Rule 19.1: When exactly 1 minor vs 1 minor (no other penalties), both are served (4v4)
+    - Rule 19.5: Otherwise, cancel majors first, then minors
     
     Returns list of net penalties added after coincidental cancellation.
     """
     current_event = plays[index]
     current_time_str = current_event.get('timeInPeriod')
     
-    # Collect all penalties at this time
+    # Collect all penalties at this time, including misconducts
     all_penalties = []
     for i in range(index, len(plays)):
         event = plays[i]
@@ -244,10 +247,6 @@ def process_penalties_at_time(plays: List[Dict], index: int, tracker: PenaltyTra
         
         if event.get('typeDescKey') == 'penalty':
             details = event.get('details', {})
-            
-            # Skip misconducts - they don't affect on-ice strength
-            if details.get('typeCode') == 'MIS':
-                continue
             
             penalty_info = {
                 'eventId': event.get('eventId'),
@@ -262,63 +261,91 @@ def process_penalties_at_time(plays: List[Dict], index: int, tracker: PenaltyTra
     if not all_penalties:
         return []
     
-    # Group penalties by type (descKey) and team
-    from collections import defaultdict
-    penalty_groups = defaultdict(lambda: {'home': [], 'away': []})
+    # Separate penalties by team and type
+    home_minors = []
+    home_majors = []
+    home_misconducts = []
+    
+    away_minors = []
+    away_majors = []
+    away_misconducts = []
     
     for penalty in all_penalties:
-        desc = penalty['desc']
-        side = 'home' if penalty['teamId'] == home_team_id else 'away'
-        penalty_groups[desc][side].append(penalty)
-    
-    # Calculate coincidental cancellations for each penalty type
-    penalties_to_track = []
-    
-    for desc, sides in penalty_groups.items():
-        home_penalties = sides['home']
-        away_penalties = sides['away']
+        is_home = penalty['teamId'] == home_team_id
         
-        home_count = len(home_penalties)
-        away_count = len(away_penalties)
-        
-        # Cancel out coincidentals for this penalty type
-        coincidental = min(home_count, away_count)
-        
-        # Add non-coincidental penalties to tracking list
-        if home_count > away_count:
-            # HOME has more of this penalty type
-            penalties_to_track.extend(home_penalties[coincidental:])
-        elif away_count > home_count:
-            # AWAY has more of this penalty type
-            penalties_to_track.extend(away_penalties[coincidental:])
-        # If equal, all cancel out for this type, add nothing
+        if penalty['typeCode'] == 'MIN':
+            if is_home:
+                home_minors.append(penalty)
+            else:
+                away_minors.append(penalty)
+        elif penalty['typeCode'] == 'MAJ':
+            if is_home:
+                home_majors.append(penalty)
+            else:
+                away_majors.append(penalty)
+        elif penalty['typeCode'] == 'MIS':
+            # Misconducts don't affect on-ice strength but must be tracked
+            if is_home:
+                home_misconducts.append(penalty)
+            else:
+                away_misconducts.append(penalty)
     
-    # For penalties on the same player at the same time, combine them into one entry
-    # with consecutive time
-    penalties_by_player = {}
+    # Check Rule 19.1: Exactly 1 minor vs 1 minor (no majors, no other penalties on clock)
+    # TODO: We'd need to check if there are other penalties on the clock
+    # For now, we'll apply this when 1 minor vs 1 minor and no majors
+    if (len(home_minors) == 1 and len(away_minors) == 1 and 
+        len(home_majors) == 0 and len(away_majors) == 0):
+        # Rule 19.1: Both minors are served (4v4)
+        # Don't cancel, track both
+        penalties_to_track = home_minors + away_minors
+    else:
+        # Rule 19.5: Normal coincidental cancellation
+        
+        # Cancel majors first
+        major_coincidental = min(len(home_majors), len(away_majors))
+        net_home_majors = home_majors[major_coincidental:]
+        net_away_majors = away_majors[major_coincidental:]
+        
+        # Cancel minors second
+        minor_coincidental = min(len(home_minors), len(away_minors))
+        net_home_minors = home_minors[minor_coincidental:]
+        net_away_minors = away_minors[minor_coincidental:]
+        
+        # Track remaining penalties after cancellation
+        penalties_to_track = net_home_majors + net_away_majors + net_home_minors + net_away_minors
+    
+    # Always track misconducts (but they don't affect on-ice strength)
+    # We'll need to flag these somehow when adding to tracker
+    penalties_to_track.extend(home_misconducts + away_misconducts)
+    
+    # Group by player and combine consecutive penalties on same player
+    from collections import defaultdict
+    penalties_by_player = defaultdict(lambda: {'eventId': None, 'teamId': None, 'playerId': None, 
+                                                'totalDuration': 0, 'penalties': []})
+    
     for penalty in penalties_to_track:
         player_id = penalty['playerId']
-        if player_id not in penalties_by_player:
-            penalties_by_player[player_id] = {
-                'eventId': penalty['eventId'],
-                'teamId': penalty['teamId'],
-                'playerId': player_id,
-                'totalDuration': 0,
-                'penalties': []
-            }
+        if penalties_by_player[player_id]['eventId'] is None:
+            penalties_by_player[player_id]['eventId'] = penalty['eventId']
+            penalties_by_player[player_id]['teamId'] = penalty['teamId']
+            penalties_by_player[player_id]['playerId'] = player_id
+        
         penalties_by_player[player_id]['totalDuration'] += penalty['duration']
         penalties_by_player[player_id]['penalties'].append(penalty)
     
     # Add to tracker
     net_penalties = []
     for player_id, combined in penalties_by_player.items():
-        # If multiple penalties on same player, they're consecutive
-        # Use the first penalty's description for reference
+        if combined['eventId'] is None:
+            continue
+            
+        # Build description
         first_penalty = combined['penalties'][0]
         desc = first_penalty['desc']
         if len(combined['penalties']) > 1:
             desc = f"{len(combined['penalties'])}x {desc}"
         
+        # Add to tracker
         tracker.add_penalty(
             combined['eventId'],
             combined['teamId'],
