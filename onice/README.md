@@ -127,7 +127,37 @@ For each second of the game:
 2. **Extra attacker:** End of game, trailing team pulls goalie (30-120 seconds)
 3. **Performance/injury:** Permanent replacement (rest of game)
 
-## Output Format
+## Shift Timing Logic
+
+### The Core Challenge
+
+NHL shift data has overlapping timestamps when players change on-the-fly:
+- **Departing player:** startTime="00:00", endTime="00:32", duration="00:32"
+- **Incoming player:** startTime="00:32", endTime="01:21", duration="00:49"
+
+Both players are marked as "on ice" at second 32, which would incorrectly show too many players.
+
+### The Solution
+
+**1. Second 0 of Each Period (Special Case)**
+- At the start of each period (seconds_into_period = 0), ONLY include players with startTime="00:00"
+- This captures the period starters cleanly
+- Applies to all periods (1, 2, 3, and OT)
+
+**2. Regular Seconds (1-1199)**
+- Players are on ice from `startTime + 1` through `endTime` (inclusive)
+- This gives the **departing player priority** - they remain on ice through their endTime
+- The incoming player starts the NEXT second
+- Example: Player A ends at 0:32 (on ice at second 32), Player B starts at 0:32 (on ice starting second 33)
+
+**3. Period Boundary Handling**
+- Shifts ending at "20:00" (1200 seconds) are capped at second 1199
+- This prevents period-end shifts from appearing at second 0 of the next period
+- Second 1200 of period N would be second 0 of period N+1, which is handled separately
+
+**4. Goal Verification**
+- Players must be on ice at their endTime (e.g., goal scored at 19:19 means player is on ice at second 1159)
+- This confirms departing players have priority at transition moments
 
 ### JSON Structure
 
@@ -191,6 +221,8 @@ period,seconds_into_period,seconds_elapsed_game,teamA,teamB,teamAskaters,teamAco
 
 ## Usage
 
+### Single Game
+
 ```bash
 cd onice
 python process_shifts.py GAME_NUMBER SEASON
@@ -206,7 +238,25 @@ python process_shifts.py 631 2025
 - JSON: `output/json/2025020631.json`
 - CSV: `output/csv/2025020631.csv`
 
-**Note:** If output files already exist, they will be replaced with new data.
+### Batch Processing
+
+Process multiple games in sequence:
+
+```bash
+cd onice
+python process_shifts.py START_GAME END_GAME SEASON
+```
+
+**Example:**
+```bash
+python process_shifts.py 600 631 2025
+```
+
+This will process games 600 through 631 (inclusive) for the 2025 season.
+
+**Note:** 
+- If output files already exist, they will be replaced with new data
+- If an input file is missing, it will be skipped with a warning
 
 ## Edge Cases & Validation
 

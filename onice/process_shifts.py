@@ -474,22 +474,15 @@ def write_csv_output(timeline: List[Dict], team_ids: List[int], output_file: Pat
 # MAIN FUNCTION
 # ============================================================================
 
-def main():
-    """Main execution function."""
-    # Validate arguments
-    if len(sys.argv) != 3:
-        print("Error: Invalid number of arguments")
-        print(f"Usage: python {sys.argv[0]} GAME_NUMBER SEASON")
-        print(f"Example: python {sys.argv[0]} 631 2025")
-        sys.exit(1)
+def process_single_game(game_number: str, season: str, script_dir: Path, project_root: Path) -> bool:
+    """
+    Process a single game.
     
-    game_number = sys.argv[1]
-    season = sys.argv[2]
-    
+    Returns:
+        True if successful, False if file not found or error occurred
+    """
     # Construct paths
     game_id = f"{season}{GAME_TYPE}{int(game_number):04d}"
-    script_dir = Path(__file__).parent
-    project_root = script_dir.parent
     
     # Input from season folder at project root
     input_file = project_root / season / "shifts" / f"{game_id}.json"
@@ -503,53 +496,105 @@ def main():
     json_output_file = json_output_dir / f"{game_id}.json"
     csv_output_file = csv_output_dir / f"{game_id}.csv"
     
-    print(f"\nNHL On-Ice Shifts Processor")
-    print(f"{'='*80}")
-    print(f"Game ID: {game_id}")
-    print(f"Input:   {input_file}")
-    print(f"Output JSON: {json_output_file}")
-    print(f"Output CSV:  {csv_output_file}")
-    print(f"{'='*80}\n")
-    
     # Check if input file exists
     if not input_file.exists():
-        print(f"Error: Input file not found: {input_file}")
+        print(f"⚠ Skipping game {game_number}: Input file not found: {input_file}")
+        return False
+    
+    try:
+        # Load shift data
+        with open(input_file, 'r') as f:
+            shifts_data = json.load(f)
+        
+        # Filter to regular shifts only
+        regular_shifts = [s for s in shifts_data['data'] if s.get('detailCode') == 0]
+        
+        # Generate timeline
+        timeline, team_ids = generate_timeline(shifts_data)
+        
+        # Write JSON output
+        with open(json_output_file, 'w') as f:
+            json.dump(timeline, f, indent=2)
+        
+        # Write CSV output
+        write_csv_output(timeline, team_ids, csv_output_file)
+        
+        print(f"✓ Game {game_number}: Processed {len(timeline)} seconds, Teams {team_ids[0]} vs {team_ids[1]}")
+        return True
+        
+    except Exception as e:
+        print(f"✗ Game {game_number}: Error - {str(e)}")
+        return False
+
+
+def main():
+    """Main execution function."""
+    # Validate arguments
+    if len(sys.argv) not in [3, 4]:
+        print("Error: Invalid number of arguments")
+        print(f"Usage for single game: python {sys.argv[0]} GAME_NUMBER SEASON")
+        print(f"Usage for batch: python {sys.argv[0]} START_GAME END_GAME SEASON")
+        print(f"Example: python {sys.argv[0]} 631 2025")
+        print(f"Example: python {sys.argv[0]} 600 631 2025")
         sys.exit(1)
     
-    # Load shift data
-    print(f"Loading shift data...")
-    with open(input_file, 'r') as f:
-        shifts_data = json.load(f)
-    print(f"✓ Loaded {len(shifts_data['data'])} shift records")
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
     
-    # Filter to regular shifts only
-    regular_shifts = [s for s in shifts_data['data'] if s.get('detailCode') == 0]
-    print(f"✓ Filtered to {len(regular_shifts)} regular shifts (detailCode=0)")
+    # Determine if single game or batch processing
+    if len(sys.argv) == 3:
+        # Single game mode
+        game_number = sys.argv[1]
+        season = sys.argv[2]
+        
+        print(f"\nNHL On-Ice Shifts Processor")
+        print(f"{'='*80}")
+        print(f"Mode: Single Game")
+        print(f"Game: {game_number}, Season: {season}")
+        print(f"{'='*80}\n")
+        
+        success = process_single_game(game_number, season, script_dir, project_root)
+        
+        if success:
+            print(f"\n{'='*80}")
+            print(f"Complete!")
+            print(f"{'='*80}\n")
+        else:
+            sys.exit(1)
     
-    # Generate timeline
-    print(f"Generating on-ice timeline...")
-    timeline, team_ids = generate_timeline(shifts_data)
-    print(f"✓ Generated timeline with {len(timeline)} seconds")
-    print(f"✓ Teams: {team_ids[0]} vs {team_ids[1]}")
-    
-    # Write JSON output
-    print(f"Writing JSON output...")
-    with open(json_output_file, 'w') as f:
-        json.dump(timeline, f, indent=2)
-    print(f"✓ JSON saved to {json_output_file}")
-    
-    # Write CSV output
-    print(f"Writing CSV output...")
-    write_csv_output(timeline, team_ids, csv_output_file)
-    print(f"✓ CSV saved to {csv_output_file}")
-    
-    # Summary statistics
-    print(f"\n{'='*80}")
-    print(f"Summary:")
-    print(f"  Total game seconds: {len(timeline)}")
-    print(f"  Periods covered: {timeline[-1]['period']}")
-    print(f"  Teams: {team_ids[0]} vs {team_ids[1]}")
-    print(f"{'='*80}\n")
+    else:
+        # Batch mode
+        start_game = int(sys.argv[1])
+        end_game = int(sys.argv[2])
+        season = sys.argv[3]
+        
+        print(f"\nNHL On-Ice Shifts Processor")
+        print(f"{'='*80}")
+        print(f"Mode: Batch Processing")
+        print(f"Games: {start_game} to {end_game} (inclusive), Season: {season}")
+        print(f"{'='*80}\n")
+        
+        successful = 0
+        skipped = 0
+        errors = 0
+        
+        for game_num in range(start_game, end_game + 1):
+            result = process_single_game(str(game_num), season, script_dir, project_root)
+            if result:
+                successful += 1
+            else:
+                if Path(project_root / season / "shifts" / f"{season}{GAME_TYPE}{game_num:04d}.json").exists():
+                    errors += 1
+                else:
+                    skipped += 1
+        
+        print(f"\n{'='*80}")
+        print(f"Batch Complete!")
+        print(f"  Successful: {successful}")
+        print(f"  Skipped: {skipped}")
+        print(f"  Errors: {errors}")
+        print(f"  Total: {end_game - start_game + 1}")
+        print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":
