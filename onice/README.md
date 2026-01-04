@@ -151,9 +151,10 @@ Both players are marked as "on ice" at second 32, which would incorrectly show t
 - Example: Player A ends at 0:32 (on ice at second 32), Player B starts at 0:32 (on ice starting second 33)
 
 **3. Period Boundary Handling**
-- Shifts ending at "20:00" (1200 seconds) are capped at second 1199
-- This prevents period-end shifts from appearing at second 0 of the next period
-- Second 1200 of period N would be second 0 of period N+1, which is handled separately
+- At the end of each period, ALL players come off the ice (period clock stops)
+- Valid seconds_into_period range: 0-1199 for regulation (20 minutes), 0-299 for OT (5 minutes)
+- Shifts ending at "20:00" are capped at second 1199
+- The next period starts fresh with only the period starters at second 0
 
 **4. Goal Verification**
 - Players must be on ice at their endTime (e.g., goal scored at 19:19 means player is on ice at second 1159)

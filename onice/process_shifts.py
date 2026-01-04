@@ -192,10 +192,11 @@ def build_player_timeline(shifts: List[Dict]) -> Dict[int, Dict[int, Set[int]]]:
     - ONLY include players with startTime="00:00" (the period starters)
     - Do NOT apply regular range logic for second 0
     
-    For all other seconds (1-1199 per period):
+    For all other seconds (1-1200 per period):
     - Players are on ice from startTime+1 through endTime (inclusive)
-    - BUT: endTime of 20:00 (1200 seconds) is actually second 0 of NEXT period
-    - So we cap at 1199 to stay within the current period
+    - This prevents overlaps during on-the-fly changes
+    - Since we use startTime+1, a shift ending at 20:00 (1200) is safe
+      (would start at second 1 of next period, which is handled separately)
     
     Args:
         shifts: List of shift dictionaries (already filtered for detailCode=0)
@@ -224,7 +225,6 @@ def build_player_timeline(shifts: List[Dict]) -> Dict[int, Dict[int, Set[int]]]:
             timeline[game_second_0][team_id].add(player_id)
     
     # Second pass: Add regular shifts (startTime+1 through endTime)
-    # Skip second 0 and don't exceed second 1199 (period max)
     for shift in shifts:
         team_id = shift['teamId']
         player_id = shift['playerId']
@@ -237,8 +237,16 @@ def build_player_timeline(shifts: List[Dict]) -> Dict[int, Dict[int, Set[int]]]:
         start_seconds = time_to_seconds(shift['startTime'])
         end_seconds = time_to_seconds(shift['endTime'])
         
-        # Cap end_seconds at 1199 (second 1200 would be second 0 of next period)
-        end_seconds = min(end_seconds, PERIOD_LENGTH_REGULATION - 1)
+        # Determine period max (all players come off at period end)
+        if period <= 3:
+            period_max = PERIOD_LENGTH_REGULATION - 1  # 1199
+        elif period == 4:
+            period_max = PERIOD_LENGTH_OT_REGULAR - 1  # 299
+        else:
+            period_max = PERIOD_LENGTH_REGULATION - 1  # Default
+        
+        # Cap at period max - everyone comes off ice at end of period
+        end_seconds = min(end_seconds, period_max)
         
         # Regular handling: player on ice from startTime+1 through endTime (inclusive)
         for seconds_into_period in range(start_seconds + 1, end_seconds + 1):
@@ -317,8 +325,16 @@ def build_goaltender_timeline(shifts: List[Dict], team_ids: List[int]) -> Dict[i
                 start_seconds = time_to_seconds(shift['startTime'])
                 end_seconds = time_to_seconds(shift['endTime'])
                 
-                # Cap end_seconds at 1199 (second 1200 would be second 0 of next period)
-                end_seconds = min(end_seconds, PERIOD_LENGTH_REGULATION - 1)
+                # Determine period max (all players come off at period end)
+                if period <= 3:
+                    period_max = PERIOD_LENGTH_REGULATION - 1  # 1199
+                elif period == 4:
+                    period_max = PERIOD_LENGTH_OT_REGULAR - 1  # 299
+                else:
+                    period_max = PERIOD_LENGTH_REGULATION - 1  # Default
+                
+                # Cap at period max - goaltender comes off ice at end of period
+                end_seconds = min(end_seconds, period_max)
                 
                 # Regular handling: goaltender on ice from startTime+1 through endTime (inclusive)
                 for seconds_into_period in range(start_seconds + 1, end_seconds + 1):
