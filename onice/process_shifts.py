@@ -60,6 +60,8 @@ def calculate_game_seconds(period: int, seconds_into_period: int) -> int:
     """
     Calculate total seconds elapsed in game.
     
+    Each period has 1201 data points (seconds 0-1200).
+    
     Args:
         period: Period number (1, 2, 3, 4)
         seconds_into_period: Seconds elapsed in current period
@@ -68,14 +70,17 @@ def calculate_game_seconds(period: int, seconds_into_period: int) -> int:
         Total seconds elapsed since start of game
     """
     if period <= 3:
-        # Regulation periods
-        return (period - 1) * PERIOD_LENGTH_REGULATION + seconds_into_period
+        # Each regulation period has 1201 data points (0-1200)
+        return (period - 1) * (PERIOD_LENGTH_REGULATION + 1) + seconds_into_period
     elif period == 4:
-        # Overtime (assume regular season for now)
-        return 3 * PERIOD_LENGTH_REGULATION + seconds_into_period
+        # 3 regulation periods + OT period
+        return 3 * (PERIOD_LENGTH_REGULATION + 1) + seconds_into_period
     else:
-        # Should not reach here for period 5 (shootout)
-        return 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR + seconds_into_period
+        # Playoff OT (periods 5+)
+        return (3 * (PERIOD_LENGTH_REGULATION + 1) + 
+                (PERIOD_LENGTH_OT_REGULAR + 1) + 
+                (period - 5) * (PERIOD_LENGTH_REGULATION + 1) + 
+                seconds_into_period)
 
 
 # ============================================================================
@@ -237,15 +242,15 @@ def build_player_timeline(shifts: List[Dict]) -> Dict[int, Dict[int, Set[int]]]:
         start_seconds = time_to_seconds(shift['startTime'])
         end_seconds = time_to_seconds(shift['endTime'])
         
-        # Determine period max (all players come off at period end)
+        # Determine period max (second 1200 is the LAST second of a 20-minute period)
         if period <= 3:
-            period_max = PERIOD_LENGTH_REGULATION - 1  # 1199
+            period_max = PERIOD_LENGTH_REGULATION  # 1200 (00:00 through 20:00)
         elif period == 4:
-            period_max = PERIOD_LENGTH_OT_REGULAR - 1  # 299
+            period_max = PERIOD_LENGTH_OT_REGULAR  # 300 (00:00 through 05:00)
         else:
-            period_max = PERIOD_LENGTH_REGULATION - 1  # Default
+            period_max = PERIOD_LENGTH_REGULATION  # Default
         
-        # Cap at period max - everyone comes off ice at end of period
+        # Cap at period max
         end_seconds = min(end_seconds, period_max)
         
         # Regular handling: player on ice from startTime+1 through endTime (inclusive)
@@ -325,15 +330,15 @@ def build_goaltender_timeline(shifts: List[Dict], team_ids: List[int]) -> Dict[i
                 start_seconds = time_to_seconds(shift['startTime'])
                 end_seconds = time_to_seconds(shift['endTime'])
                 
-                # Determine period max (all players come off at period end)
+                # Determine period max (second 1200 is the LAST second of a 20-minute period)
                 if period <= 3:
-                    period_max = PERIOD_LENGTH_REGULATION - 1  # 1199
+                    period_max = PERIOD_LENGTH_REGULATION  # 1200
                 elif period == 4:
-                    period_max = PERIOD_LENGTH_OT_REGULAR - 1  # 299
+                    period_max = PERIOD_LENGTH_OT_REGULAR  # 300
                 else:
-                    period_max = PERIOD_LENGTH_REGULATION - 1  # Default
+                    period_max = PERIOD_LENGTH_REGULATION  # Default
                 
-                # Cap at period max - goaltender comes off ice at end of period
+                # Cap at period max
                 end_seconds = min(end_seconds, period_max)
                 
                 # Regular handling: goaltender on ice from startTime+1 through endTime (inclusive)
@@ -351,6 +356,9 @@ def build_goaltender_timeline(shifts: List[Dict], team_ids: List[int]) -> Dict[i
 def generate_timeline(shifts_data: Dict) -> Tuple[List[Dict], List[int]]:
     """
     Generate the complete second-by-second timeline.
+    
+    Processes each period separately to avoid boundary issues.
+    Each period has seconds 0-1200 (regulation) or 0-300 (OT).
     
     Args:
         shifts_data: Raw shift data from JSON file
@@ -370,63 +378,60 @@ def generate_timeline(shifts_data: Dict) -> Tuple[List[Dict], List[int]]:
     # Build goaltender timeline
     goaltender_timeline = build_goaltender_timeline(shifts, team_ids)
     
-    # Determine total game length
+    # Determine which periods were played
     max_period = max(s['period'] for s in shifts if s['period'] < 5)  # Exclude shootout
+    periods_to_process = list(range(1, max_period + 1))
     
-    if max_period <= 3:
-        total_seconds = 3 * PERIOD_LENGTH_REGULATION
-    elif max_period == 4:
-        total_seconds = 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR
-    else:
-        total_seconds = 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR
-    
-    # Build the timeline
+    # Build the timeline period-by-period
     timeline = []
+    seconds_elapsed_game = 0
     
-    for game_second in range(total_seconds):
-        # Determine period and seconds into period
-        if game_second < PERIOD_LENGTH_REGULATION:
-            period = 1
-            seconds_into_period = game_second
-        elif game_second < 2 * PERIOD_LENGTH_REGULATION:
-            period = 2
-            seconds_into_period = game_second - PERIOD_LENGTH_REGULATION
-        elif game_second < 3 * PERIOD_LENGTH_REGULATION:
-            period = 3
-            seconds_into_period = game_second - 2 * PERIOD_LENGTH_REGULATION
+    for period in periods_to_process:
+        # Determine period length
+        if period <= 3:
+            period_length = PERIOD_LENGTH_REGULATION  # 1200 seconds (20 minutes)
+        elif period == 4:
+            period_length = PERIOD_LENGTH_OT_REGULAR  # 300 seconds (5 minutes)
         else:
-            period = 4
-            seconds_into_period = game_second - 3 * PERIOD_LENGTH_REGULATION
+            # Playoff OT (periods 5+) - 20 minutes each
+            period_length = PERIOD_LENGTH_REGULATION
         
-        # Build skaters data for this second
-        skaters_data = {}
-        
-        for team_id in team_ids:
-            # Get players on ice (excluding goaltenders)
-            players_on_ice = list(player_timeline[game_second][team_id])
+        # Generate seconds 0 through period_length for this period
+        for seconds_into_period in range(0, period_length + 1):
+            # Build skaters data for this second
+            skaters_data = {}
             
-            # Get goaltender
-            goaltender_id = goaltender_timeline[game_second][team_id]
+            game_second = calculate_game_seconds(period, seconds_into_period)
             
-            # Remove goaltender from skaters list if present
-            if goaltender_id and goaltender_id in players_on_ice:
-                players_on_ice.remove(goaltender_id)
+            for team_id in team_ids:
+                # Get players on ice (excluding goaltenders)
+                players_on_ice = list(player_timeline[game_second][team_id])
+                
+                # Get goaltender
+                goaltender_id = goaltender_timeline[game_second][team_id]
+                
+                # Remove goaltender from skaters list if present
+                if goaltender_id and goaltender_id in players_on_ice:
+                    players_on_ice.remove(goaltender_id)
+                
+                skaters_data[str(team_id)] = {
+                    'onIce': sorted(players_on_ice),
+                    'count': len(players_on_ice),
+                    'goaltender': goaltender_id
+                }
             
-            skaters_data[str(team_id)] = {
-                'onIce': sorted(players_on_ice),
-                'count': len(players_on_ice),
-                'goaltender': goaltender_id
+            # Add entry to timeline
+            entry = {
+                'period': period,
+                'seconds_into_period': seconds_into_period,
+                'seconds_elapsed_game': seconds_elapsed_game,
+                'skaters': skaters_data
             }
+            
+            timeline.append(entry)
+            seconds_elapsed_game += 1
         
-        # Add entry to timeline
-        entry = {
-            'period': period,
-            'seconds_into_period': seconds_into_period,
-            'seconds_elapsed_game': game_second,
-            'skaters': skaters_data
-        }
-        
-        timeline.append(entry)
+        # Period complete - ice is cleared automatically when next period starts
     
     return timeline, team_ids
 

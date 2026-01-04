@@ -137,14 +137,23 @@ NHL shift data has overlapping timestamps when players change on-the-fly:
 
 Both players are marked as "on ice" at second 32, which would incorrectly show too many players.
 
-### The Solution
+### The Solution: Period-by-Period Processing
+
+Instead of creating one continuous timeline, we process each period independently. This approach:
+- Eliminates period boundary issues
+- Naturally handles overtime periods of varying lengths
+- Ensures accurate time-on-ice calculations
+
+**Each period has seconds 0-1200 (1201 data points representing a 20-minute period):**
+- Second 0 = special case (period starters only)
+- Seconds 1-1200 = regular play
 
 **1. Second 0 of Each Period (Special Case)**
 - At the start of each period (seconds_into_period = 0), ONLY include players with startTime="00:00"
 - This captures the period starters cleanly
 - Applies to all periods (1, 2, 3, and OT)
 
-**2. Regular Seconds (1-1199)**
+**2. Regular Seconds (1-1200)**
 - Players are on ice from `startTime + 1` through `endTime` (inclusive)
 - This gives the **departing player priority** - they remain on ice through their endTime
 - The incoming player starts the NEXT second
@@ -152,13 +161,25 @@ Both players are marked as "on ice" at second 32, which would incorrectly show t
 
 **3. Period Boundary Handling**
 - At the end of each period, ALL players come off the ice (period clock stops)
-- Valid seconds_into_period range: 0-1199 for regulation (20 minutes), 0-299 for OT (5 minutes)
-- Shifts ending at "20:00" are capped at second 1199
+- Valid seconds_into_period range: 0-1200 for regulation (20 minutes), 0-300 for OT (5 minutes)
+- Each period is processed independently, so no overlap between periods
 - The next period starts fresh with only the period starters at second 0
 
 **4. Goal Verification**
 - Players must be on ice at their endTime (e.g., goal scored at 19:19 means player is on ice at second 1159)
 - This confirms departing players have priority at transition moments
+
+### Timeline Structure
+
+**Regulation game:**
+- Period 1: seconds_into_period 0-1200 (seconds_elapsed_game 0-1200)
+- Period 2: seconds_into_period 0-1200 (seconds_elapsed_game 1201-2401)
+- Period 3: seconds_into_period 0-1200 (seconds_elapsed_game 2402-3602)
+- **Total: 3603 seconds**
+
+**With overtime:**
+- Period 4: seconds_into_period 0-300 for regular season (seconds_elapsed_game 3603-3903)
+- Period 4+: seconds_into_period 0-1200 for playoff overtime (20-minute periods)
 
 ### JSON Structure
 
