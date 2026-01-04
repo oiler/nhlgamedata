@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""
+NHL On-Ice Shifts Processor
+
+Processes NHL shift data to create a second-by-second timeline showing
+which players and goaltenders are on the ice for each team.
+
+Usage:
+    python process_shifts.py GAME_NUMBER SEASON
+
+Example:
+    python process_shifts.py 631 2025
+    
+This will:
+- Read: ../2025/shifts/2025020631.json
+- Output JSON: output/json/2025020631.json
+- Output CSV: output/csv/2025020631.csv
+"""
+
+import sys
+import json
+import csv
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Optional
+from collections import defaultdict
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+GAME_TYPE = "02"  # Regular season
+PERIOD_LENGTH_REGULATION = 1200  # 20 minutes in seconds
+PERIOD_LENGTH_OT_REGULAR = 300   # 5 minutes in seconds
+PERIOD_LENGTH_OT_PLAYOFF = 1200  # 20 minutes in seconds
+
+
+# ============================================================================
+# TIME CONVERSION FUNCTIONS
+# ============================================================================
+
+def time_to_seconds(time_str: str) -> int:
+    """
+    Convert MM:SS format to total seconds.
+    
+    Args:
+        time_str: Time in MM:SS format (e.g., "02:30")
+    
+    Returns:
+        Total seconds (e.g., 150)
+    """
+    if not time_str:
+        return 0
+    parts = time_str.split(":")
+    minutes = int(parts[0])
+    seconds = int(parts[1])
+    return minutes * 60 + seconds
+
+
+def calculate_game_seconds(period: int, seconds_into_period: int) -> int:
+    """
+    Calculate total seconds elapsed in game.
+    
+    Args:
+        period: Period number (1, 2, 3, 4)
+        seconds_into_period: Seconds elapsed in current period
+    
+    Returns:
+        Total seconds elapsed since start of game
+    """
+    if period <= 3:
+        # Regulation periods
+        return (period - 1) * PERIOD_LENGTH_REGULATION + seconds_into_period
+    elif period == 4:
+        # Overtime (assume regular season for now)
+        return 3 * PERIOD_LENGTH_REGULATION + seconds_into_period
+    else:
+        # Should not reach here for period 5 (shootout)
+        return 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR + seconds_into_period
+
+
+# ============================================================================
+# GOALTENDER DETECTION
+# ============================================================================
+
+def identify_starting_goaltenders(shifts: List[Dict], team_ids: List[int]) -> Dict[int, int]:
+    """
+    Identify the starting goaltender for each team.
+    
+    Strategy:
+    1. Find all players who start at period 1, time 00:00
+    2. For each team, calculate total duration in period 1
+    3. Player with duration closest to 20:00 (1200 seconds) is the goaltender
+    
+    Args:
+        shifts: List of all shift dictionaries
+        team_ids: List of team IDs in the game
+    
+    Returns:
+        Dict mapping teamId -> playerId of starting goaltender
+    """
+    starting_goaltenders = {}
+    
+    for team_id in team_ids:
+        # Find all players on this team who start at period 1, time 00:00
+        period_1_starters = []
+        
+        for shift in shifts:
+            if (shift['teamId'] == team_id and 
+                shift['period'] == 1 and 
+                shift['startTime'] == '00:00' and
+                shift['detailCode'] == 0):
+                period_1_starters.append(shift['playerId'])
+        
+        # Get unique players
+        unique_starters = set(period_1_starters)
+        
+        # Calculate total duration in period 1 for each starter
+        player_durations = defaultdict(int)
+        
+        for shift in shifts:
+            if (shift['teamId'] == team_id and 
+                shift['period'] == 1 and
+                shift['playerId'] in unique_starters and
+                shift['detailCode'] == 0):
+                duration_seconds = time_to_seconds(shift['duration'])
+                player_durations[shift['playerId']] += duration_seconds
+        
+        # Player with duration closest to 1200 seconds (20:00) is the goaltender
+        if player_durations:
+            goaltender_id = max(player_durations.items(), 
+                                key=lambda x: x[1])[0]  # Player with most time
+            starting_goaltenders[team_id] = goaltender_id
+    
+    return starting_goaltenders
+
+
+def detect_goaltender_changes(shifts: List[Dict], team_id: int, 
+                               starting_goaltender: int) -> Dict[int, int]:
+    """
+    Detect if/when a goaltender is replaced.
+    
+    Returns a mapping of period -> goaltender playerId for that period.
+    
+    Args:
+        shifts: List of all shift dictionaries
+        team_id: Team ID to analyze
+        starting_goaltender: PlayerId of starting goaltender
+    
+    Returns:
+        Dict mapping period number -> playerId of goaltender in that period
+    """
+    # Start with assumption that starting goaltender plays all periods
+    period_goaltenders = {1: starting_goaltender, 2: starting_goaltender, 
+                          3: starting_goaltender, 4: starting_goaltender}
+    
+    # Get all shifts for this team
+    team_shifts = [s for s in shifts if s['teamId'] == team_id and s['detailCode'] == 0]
+    
+    # Check each period for potential goaltender changes
+    for period in [2, 3, 4]:
+        # Find players who start at 00:00 of this period
+        period_starters = []
+        for shift in team_shifts:
+            if shift['period'] == period and shift['startTime'] == '00:00':
+                period_starters.append({
+                    'playerId': shift['playerId'],
+                    'duration': time_to_seconds(shift['duration'])
+                })
+        
+        # If we find a new player (not the starting goaltender) with a long shift (>120 seconds)
+        # at the start of a period, they're likely the new goaltender
+        for starter in period_starters:
+            if starter['playerId'] != starting_goaltender and starter['duration'] > 120:
+                period_goaltenders[period] = starter['playerId']
+                # Update subsequent periods too
+                for p in range(period + 1, 5):
+                    period_goaltenders[p] = starter['playerId']
+                break
+    
+    return period_goaltenders
+
+
+# ============================================================================
+# SHIFT PROCESSING
+# ============================================================================
+
+def build_player_timeline(shifts: List[Dict]) -> Dict[int, Dict[int, Set[int]]]:
+    """
+    Build a timeline of which players are on ice at each second.
+    
+    Special handling for second 0 of EACH period:
+    - ONLY include players with startTime="00:00" (the period starters)
+    - Do NOT apply regular range logic for second 0
+    
+    For all other seconds (1-1199 per period):
+    - Players are on ice from startTime+1 through endTime (inclusive)
+    - BUT: endTime of 20:00 (1200 seconds) is actually second 0 of NEXT period
+    - So we cap at 1199 to stay within the current period
+    
+    Args:
+        shifts: List of shift dictionaries (already filtered for detailCode=0)
+    
+    Returns:
+        Dict mapping game_second -> teamId -> set of playerIds on ice
+    """
+    # Structure: {game_second: {teamId: {playerId, playerId, ...}}}
+    timeline = defaultdict(lambda: defaultdict(set))
+    
+    # First pass: Add period starters at second 0 of each period
+    for shift in shifts:
+        team_id = shift['teamId']
+        player_id = shift['playerId']
+        period = shift['period']
+        
+        # Skip shootout (period 5)
+        if period == 5:
+            continue
+        
+        start_seconds = time_to_seconds(shift['startTime'])
+        
+        # Add period starters to second 0
+        if start_seconds == 0:
+            game_second_0 = calculate_game_seconds(period, 0)
+            timeline[game_second_0][team_id].add(player_id)
+    
+    # Second pass: Add regular shifts (startTime+1 through endTime)
+    # Skip second 0 and don't exceed second 1199 (period max)
+    for shift in shifts:
+        team_id = shift['teamId']
+        player_id = shift['playerId']
+        period = shift['period']
+        
+        # Skip shootout (period 5)
+        if period == 5:
+            continue
+        
+        start_seconds = time_to_seconds(shift['startTime'])
+        end_seconds = time_to_seconds(shift['endTime'])
+        
+        # Cap end_seconds at 1199 (second 1200 would be second 0 of next period)
+        end_seconds = min(end_seconds, PERIOD_LENGTH_REGULATION - 1)
+        
+        # Regular handling: player on ice from startTime+1 through endTime (inclusive)
+        for seconds_into_period in range(start_seconds + 1, end_seconds + 1):
+            game_second = calculate_game_seconds(period, seconds_into_period)
+            timeline[game_second][team_id].add(player_id)
+    
+    return timeline
+
+
+def build_goaltender_timeline(shifts: List[Dict], team_ids: List[int]) -> Dict[int, Dict[int, Optional[int]]]:
+    """
+    Build a timeline of which goaltender is on ice for each team at each second.
+    
+    Special handling for second 0 of EACH period:
+    - ONLY include goaltenders with startTime="00:00"
+    - Do NOT apply regular range logic for second 0
+    
+    For all other seconds (1-1199 per period):
+    - Goaltenders are on ice from startTime+1 through endTime (inclusive)
+    
+    Args:
+        shifts: List of shift dictionaries
+        team_ids: List of team IDs
+    
+    Returns:
+        Dict mapping game_second -> teamId -> playerId (or None if no goaltender)
+    """
+    # Identify starting goaltenders
+    starting_goaltenders = identify_starting_goaltenders(shifts, team_ids)
+    
+    # Detect any goaltender changes
+    goaltender_by_period = {}
+    for team_id in team_ids:
+        if team_id in starting_goaltenders:
+            goaltender_by_period[team_id] = detect_goaltender_changes(
+                shifts, team_id, starting_goaltenders[team_id]
+            )
+    
+    # Build timeline
+    timeline = defaultdict(lambda: defaultdict(lambda: None))
+    
+    for team_id in team_ids:
+        if team_id not in starting_goaltenders:
+            continue
+        
+        # Get all shifts for goaltenders on this team
+        goaltender_ids = set(goaltender_by_period[team_id].values())
+        
+        # First pass: Add period starters at second 0
+        for shift in shifts:
+            if (shift['teamId'] == team_id and 
+                shift['playerId'] in goaltender_ids and
+                shift['detailCode'] == 0):
+                
+                period = shift['period']
+                if period == 5:  # Skip shootout
+                    continue
+                
+                start_seconds = time_to_seconds(shift['startTime'])
+                
+                # Add goaltender to second 0 if they start the period
+                if start_seconds == 0:
+                    game_second_0 = calculate_game_seconds(period, 0)
+                    timeline[game_second_0][team_id] = shift['playerId']
+        
+        # Second pass: Add regular shifts (startTime+1 through endTime)
+        for shift in shifts:
+            if (shift['teamId'] == team_id and 
+                shift['playerId'] in goaltender_ids and
+                shift['detailCode'] == 0):
+                
+                period = shift['period']
+                if period == 5:  # Skip shootout
+                    continue
+                
+                start_seconds = time_to_seconds(shift['startTime'])
+                end_seconds = time_to_seconds(shift['endTime'])
+                
+                # Cap end_seconds at 1199 (second 1200 would be second 0 of next period)
+                end_seconds = min(end_seconds, PERIOD_LENGTH_REGULATION - 1)
+                
+                # Regular handling: goaltender on ice from startTime+1 through endTime (inclusive)
+                for seconds_into_period in range(start_seconds + 1, end_seconds + 1):
+                    game_second = calculate_game_seconds(period, seconds_into_period)
+                    timeline[game_second][team_id] = shift['playerId']
+    
+    return timeline
+
+
+# ============================================================================
+# TIMELINE GENERATION
+# ============================================================================
+
+def generate_timeline(shifts_data: Dict) -> Tuple[List[Dict], List[int]]:
+    """
+    Generate the complete second-by-second timeline.
+    
+    Args:
+        shifts_data: Raw shift data from JSON file
+    
+    Returns:
+        Tuple of (timeline list, sorted team_ids list)
+    """
+    # Filter shifts to only regular shifts (detailCode = 0)
+    shifts = [s for s in shifts_data['data'] if s.get('detailCode') == 0]
+    
+    # Get unique team IDs and sort them
+    team_ids = sorted(set(s['teamId'] for s in shifts))
+    
+    # Build player timeline (skaters)
+    player_timeline = build_player_timeline(shifts)
+    
+    # Build goaltender timeline
+    goaltender_timeline = build_goaltender_timeline(shifts, team_ids)
+    
+    # Determine total game length
+    max_period = max(s['period'] for s in shifts if s['period'] < 5)  # Exclude shootout
+    
+    if max_period <= 3:
+        total_seconds = 3 * PERIOD_LENGTH_REGULATION
+    elif max_period == 4:
+        total_seconds = 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR
+    else:
+        total_seconds = 3 * PERIOD_LENGTH_REGULATION + PERIOD_LENGTH_OT_REGULAR
+    
+    # Build the timeline
+    timeline = []
+    
+    for game_second in range(total_seconds):
+        # Determine period and seconds into period
+        if game_second < PERIOD_LENGTH_REGULATION:
+            period = 1
+            seconds_into_period = game_second
+        elif game_second < 2 * PERIOD_LENGTH_REGULATION:
+            period = 2
+            seconds_into_period = game_second - PERIOD_LENGTH_REGULATION
+        elif game_second < 3 * PERIOD_LENGTH_REGULATION:
+            period = 3
+            seconds_into_period = game_second - 2 * PERIOD_LENGTH_REGULATION
+        else:
+            period = 4
+            seconds_into_period = game_second - 3 * PERIOD_LENGTH_REGULATION
+        
+        # Build skaters data for this second
+        skaters_data = {}
+        
+        for team_id in team_ids:
+            # Get players on ice (excluding goaltenders)
+            players_on_ice = list(player_timeline[game_second][team_id])
+            
+            # Get goaltender
+            goaltender_id = goaltender_timeline[game_second][team_id]
+            
+            # Remove goaltender from skaters list if present
+            if goaltender_id and goaltender_id in players_on_ice:
+                players_on_ice.remove(goaltender_id)
+            
+            skaters_data[str(team_id)] = {
+                'onIce': sorted(players_on_ice),
+                'count': len(players_on_ice),
+                'goaltender': goaltender_id
+            }
+        
+        # Add entry to timeline
+        entry = {
+            'period': period,
+            'seconds_into_period': seconds_into_period,
+            'seconds_elapsed_game': game_second,
+            'skaters': skaters_data
+        }
+        
+        timeline.append(entry)
+    
+    return timeline, team_ids
+
+
+def write_csv_output(timeline: List[Dict], team_ids: List[int], output_file: Path):
+    """
+    Write timeline to CSV format.
+    
+    Args:
+        timeline: List of timeline entries
+        team_ids: Sorted list of team IDs [teamA, teamB]
+        output_file: Path to output CSV file
+    """
+    team_a = str(team_ids[0])
+    team_b = str(team_ids[1])
+    
+    with open(output_file, 'w', newline='') as f:
+        writer = csv.writer(f)
+        
+        # Write header
+        writer.writerow([
+            'period',
+            'seconds_into_period',
+            'seconds_elapsed_game',
+            'teamA',
+            'teamB',
+            'teamAskaters',
+            'teamAcount',
+            'teamAgoaltender',
+            'teamBskaters',
+            'teamBcount',
+            'teamBgoaltender'
+        ])
+        
+        # Write data rows
+        for entry in timeline:
+            team_a_data = entry['skaters'][team_a]
+            team_b_data = entry['skaters'][team_b]
+            
+            # Format skater lists as comma-separated playerIds in brackets
+            team_a_skaters = '[' + ','.join(str(p) for p in team_a_data['onIce']) + ']'
+            team_b_skaters = '[' + ','.join(str(p) for p in team_b_data['onIce']) + ']'
+            
+            writer.writerow([
+                entry['period'],
+                entry['seconds_into_period'],
+                entry['seconds_elapsed_game'],
+                team_a,
+                team_b,
+                team_a_skaters,
+                team_a_data['count'],
+                team_a_data['goaltender'] if team_a_data['goaltender'] else '',
+                team_b_skaters,
+                team_b_data['count'],
+                team_b_data['goaltender'] if team_b_data['goaltender'] else ''
+            ])
+
+
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
+
+def main():
+    """Main execution function."""
+    # Validate arguments
+    if len(sys.argv) != 3:
+        print("Error: Invalid number of arguments")
+        print(f"Usage: python {sys.argv[0]} GAME_NUMBER SEASON")
+        print(f"Example: python {sys.argv[0]} 631 2025")
+        sys.exit(1)
+    
+    game_number = sys.argv[1]
+    season = sys.argv[2]
+    
+    # Construct paths
+    game_id = f"{season}{GAME_TYPE}{int(game_number):04d}"
+    script_dir = Path(__file__).parent
+    project_root = script_dir.parent
+    
+    # Input from season folder at project root
+    input_file = project_root / season / "shifts" / f"{game_id}.json"
+    
+    # Output to onice/output/json/ and onice/output/csv/
+    json_output_dir = script_dir / "output" / "json"
+    csv_output_dir = script_dir / "output" / "csv"
+    json_output_dir.mkdir(parents=True, exist_ok=True)
+    csv_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    json_output_file = json_output_dir / f"{game_id}.json"
+    csv_output_file = csv_output_dir / f"{game_id}.csv"
+    
+    print(f"\nNHL On-Ice Shifts Processor")
+    print(f"{'='*80}")
+    print(f"Game ID: {game_id}")
+    print(f"Input:   {input_file}")
+    print(f"Output JSON: {json_output_file}")
+    print(f"Output CSV:  {csv_output_file}")
+    print(f"{'='*80}\n")
+    
+    # Check if input file exists
+    if not input_file.exists():
+        print(f"Error: Input file not found: {input_file}")
+        sys.exit(1)
+    
+    # Load shift data
+    print(f"Loading shift data...")
+    with open(input_file, 'r') as f:
+        shifts_data = json.load(f)
+    print(f"✓ Loaded {len(shifts_data['data'])} shift records")
+    
+    # Filter to regular shifts only
+    regular_shifts = [s for s in shifts_data['data'] if s.get('detailCode') == 0]
+    print(f"✓ Filtered to {len(regular_shifts)} regular shifts (detailCode=0)")
+    
+    # Generate timeline
+    print(f"Generating on-ice timeline...")
+    timeline, team_ids = generate_timeline(shifts_data)
+    print(f"✓ Generated timeline with {len(timeline)} seconds")
+    print(f"✓ Teams: {team_ids[0]} vs {team_ids[1]}")
+    
+    # Write JSON output
+    print(f"Writing JSON output...")
+    with open(json_output_file, 'w') as f:
+        json.dump(timeline, f, indent=2)
+    print(f"✓ JSON saved to {json_output_file}")
+    
+    # Write CSV output
+    print(f"Writing CSV output...")
+    write_csv_output(timeline, team_ids, csv_output_file)
+    print(f"✓ CSV saved to {csv_output_file}")
+    
+    # Summary statistics
+    print(f"\n{'='*80}")
+    print(f"Summary:")
+    print(f"  Total game seconds: {len(timeline)}")
+    print(f"  Periods covered: {timeline[-1]['period']}")
+    print(f"  Teams: {team_ids[0]} vs {team_ids[1]}")
+    print(f"{'='*80}\n")
+
+
+if __name__ == "__main__":
+    main()
