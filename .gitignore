@@ -1,9 +1,4 @@
 .DS_Store
-2025
-2024
-2023
 errors.json
-plays/output
-timelines/output
-onice/output
-temp
+data/
+temp/
